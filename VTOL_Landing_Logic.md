@@ -674,3 +674,267 @@ QPOS_LAND_DESCEND -> LAND_FINAL -> LAND_COMPLETE
 | 尾座机过渡完成判断 | `tailsitter.cpp` | 553 |
 | 尾座机VTOL过渡角度 | `tailsitter.cpp` | 40 |
 | 尾座机姿态控制切换 | `quadplane.cpp` | 962 |
+
+---
+
+## 八、尾座式垂起过渡状态机（Tailsitter_Transition::State）
+
+尾座机除了降落位置控制状态机（QPOS_*）之外，还有一套独立的**过渡状态机**，用于管理固定翼和VTOL模式之间的姿态翻转。
+
+### 8.1 状态定义
+
+[tailsitter.h:194-198](../ArduPlane/tailsitter.h#L194-L198)
+
+```cpp
+enum class State {
+    ANGLE_WAIT_FW   = 0,   // 等待抬头到固定翼角度（VTOL->固定翼过渡）
+    ANGLE_WAIT_VTOL = 1,   // 等待低头到VTOL角度（固定翼->VTOL过渡）
+    DONE            = 2,   // 过渡完成，当前模式稳定
+} transition_state;
+```
+
+### 8.2 VTOL -> 固定翼过渡（ANGLE_WAIT_FW）
+
+**触发条件：** 从VTOL模式切换到固定翼模式（如TAKEOFF后切换AUTO）
+
+**流程：**
+
+```
+VTOL竖直飞行
+    |
+    v
+ANGLE_WAIT_FW
+    - 强制机头下压，俯仰角线性减小
+    - 目标：俯仰角 < Q_TAILSIT_ANGLE (默认45度)
+    - 横滚：强制为0
+    - 油门：max(悬停油门, 当前油门)
+    - 多旋翼姿态控制运行
+    |
+    v 俯仰角 < 45度
+transition_fw_complete() 返回 true
+    |
+    v
+DONE（固定翼稳定飞行）
+    - 设置前向俯仰限制 (fw_limit_start_ms)
+    - 防止机头过快上抬
+```
+
+**代码：** [tailsitter.cpp:847-873](../ArduPlane/tailsitter.cpp#L847-L873)
+
+```cpp
+case State::ANGLE_WAIT_FW: {
+    if (tailsitter.transition_fw_complete()) {
+        transition_state = State::DONE;
+        fw_limit_start_ms = now;
+        fw_limit_initial_pitch = constrain_float(quadplane.ahrs.pitch_sensor,-8500,8500);
+        break;
+    }
+    // 强制机头下压
+    plane.nav_pitch_cd = constrain_float(
+        fw_transition_initial_pitch - (transition_rate_fw * dt) * 0.1f,
+        -8500, 8500);
+    plane.nav_roll_cd = 0;
+    // 运行多旋翼姿态控制
+    quadplane.attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(...);
+    quadplane.motors_output();
+}
+```
+
+### 8.3 固定翼 -> VTOL过渡（ANGLE_WAIT_VTOL）
+
+**触发条件：** 从固定翼模式切换到VTOL模式（如QLAND/QRTL）
+
+**流程：**
+
+```
+固定翼水平飞行
+    |
+    v 切换到VTOL模式
+ANGLE_WAIT_VTOL
+    - 固定翼代码接管控制
+    - 强制机头上抬，俯仰角线性增加
+    - 目标：俯仰角 > Q_TAILSIT_ANG_VT (默认45度)
+    - 横滚：强制为0
+    - 油门：恒定（悬停油门或巡航油门较大值）
+    - 多旋翼输出被跳过
+    - 位置控制暂停
+    |
+    v 俯仰角 > 45度
+transition_vtol_complete() 返回 true
+    |
+    v
+打印 "Transition VTOL done"
+vtol_limit_start_ms = now
+    |
+    v
+DONE（VTOL稳定飞行）
+    - 设置VTOL俯仰限制 (vtol_limit_start_ms)
+    - 防止机头过快下压
+```
+
+**进入 ANGLE_WAIT_VTOL：** [tailsitter.cpp:885-922](../ArduPlane/tailsitter.cpp#L885-L922)
+
+```cpp
+void Tailsitter_Transition::VTOL_update()
+{
+    if ((now - last_vtol_mode_ms) > 1000) {
+        // 刚进入VTOL模式，设置过渡状态
+        transition_state = State::ANGLE_WAIT_VTOL;
+    }
+    last_vtol_mode_ms = now;
+
+    if (transition_state == State::ANGLE_WAIT_VTOL) {
+        if (!quadplane.tailsitter.transition_vtol_complete()) {
+            return;  // 过渡未完成，继续等待
+        }
+        // 过渡完成，设置VTOL俯仰限制
+        vtol_limit_start_ms = now;
+        vtol_limit_initial_pitch = quadplane.ahrs_view->pitch_sensor;
+    }
+    restart();  // 重置为固定翼过渡做准备
+}
+```
+
+**ANGLE_WAIT_VTOL 期间的姿态控制：** [tailsitter.cpp:940-952](../ArduPlane/tailsitter.cpp#L940-L952)
+
+```cpp
+void Tailsitter_Transition::set_FW_roll_pitch(int32_t& nav_pitch_cd, int32_t& nav_roll_cd)
+{
+    if (tailsitter.in_vtol_transition(now)) {
+        // 过渡期间：强制抬头 + 横滚水平
+        uint32_t dt = now - vtol_transition_start_ms;
+        nav_pitch_cd = constrain_float(
+            vtol_transition_initial_pitch + (tailsitter.transition_rate_vtol * dt) * 0.1f,
+            -8500, 8500);
+        nav_roll_cd = 0;
+    }
+}
+```
+
+### 8.4 过渡完成判断
+
+**VTOL->固定翼完成条件** [tailsitter.cpp:527-547](../ArduPlane/tailsitter.cpp#L527-L547)
+
+```cpp
+bool Tailsitter::transition_fw_complete(void)
+{
+    // 俯仰角 < 过渡角度（默认45度）
+    if (labs(quadplane.ahrs_view->pitch_sensor) > transition_angle_fw*100) {
+        return true;
+    }
+    // 横滚误差过大
+    if (labs(quadplane.ahrs_view->roll_sensor) > MAX(4500, plane.roll_limit_cd + 500)) {
+        return true;
+    }
+    // 超时
+    if (超时) return true;
+}
+```
+
+**固定翼->VTOL完成条件** [tailsitter.cpp:553-586](../ArduPlane/tailsitter.cpp#L553-L586)
+
+```cpp
+bool Tailsitter::transition_vtol_complete(void) const
+{
+    // 未解锁时立即完成
+    if (!plane.arming.is_armed_and_safety_off()) return true;
+
+    // 零油门+地速<1m/s（仅矢量尾座机，地面保护）
+    if ((quadplane.get_pilot_throttle() < 0.05f) && _is_vectored) {
+        if (quadplane.ahrs.groundspeed() < 1.0f) return true;
+    }
+
+    // 俯仰角 > 过渡角度（默认45度）
+    const float trans_angle = get_transition_angle_vtol();
+    if (labs(plane.ahrs.pitch_sensor) > trans_angle*100) {
+        return true;
+    }
+
+    // 横滚误差过大
+    if (roll_cd > MAX(4500, plane.roll_limit_cd + 500)) {
+        return true;
+    }
+
+    // 超时
+    if (超时) return true;
+}
+```
+
+### 8.5 过渡期间实际控制流
+
+```
+主循环 quadplane.update()
+    |
+    ├── 固定翼导航更新 (nav_controller->update_waypoint)
+    |       └── 计算 nav_roll_cd, nav_pitch_cd
+    |
+    ├── Tailsitter_Transition::set_FW_roll_pitch()
+    |       └── 覆盖俯仰角：按 rate 线性抬头/低头
+    |       └── 覆盖横滚角：强制为0
+    |
+    ├── 固定翼稳定代码 (stabilize/calc_nav_roll_pitch)
+    |       └── 控制舵面
+    |
+    ├── motors_output()
+    |       └── 检查 tailsitter.in_vtol_transition()
+    |       └── 是 → 直接返回（跳过多旋翼输出）
+    |
+    └── Tailsitter::output()
+            └── 恒定油门输出到左右电机
+            └── 方向舵居中
+            └── 固定翼电机掩码
+```
+
+### 8.6 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `Q_TAILSIT_ANGLE` | 45度 | 固定翼过渡角度阈值 |
+| `Q_TAILSIT_ANG_VT` | 0（用Q_TAILSIT_ANGLE） | VTOL过渡角度 |
+| `transition_rate_fw` | 自动计算 | 固定翼过渡速率 (deg/s) |
+| `transition_rate_vtol` | 自动计算 | VTOL过渡速率 (deg/s) |
+| `Q_TAILSIT_THR_VT` | -1 | 过渡油门（-1=自动） |
+
+### 8.7 调试日志对应的状态流转
+
+以用户提供的日志为例：
+
+```
+固定翼飞行
+    |
+    v 进入QLAND
+QPOS_APPROACH（固定翼接近）
+    |
+    v 距离 < 停止距离(208m)
+QPOS_POSITION1（VTOL位置控制）
+    ├── transition_state = ANGLE_WAIT_VTOL  ← 进入过渡状态
+    ├── 固定翼代码接管控制
+    ├── 强制机头上抬
+    ├── 位置控制暂停
+    ├── 多旋翼输出跳过
+    │
+    v 俯仰角 > 45度
+"Transition VTOL done"  ← 过渡完成
+    ├── transition_state 变为 DONE
+    ├── vtol_limit_start_ms 设置
+    ├── 恢复多旋翼控制
+    ├── 恢复位置控制
+    │
+    v 但此时已经冲到 d=5.7m
+"VTOL Overshoot"  ← 冲过头
+```
+
+### 8.8 核心代码定位（过渡状态机）
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 过渡状态定义 | `tailsitter.h` | 194-198 |
+| VTOL->固定翼过渡 | `tailsitter.cpp` | 847-873 |
+| 固定翼->VTOL过渡 | `tailsitter.cpp` | 885-922 |
+| 固定翼过渡完成判断 | `tailsitter.cpp` | 527-547 |
+| VTOL过渡完成判断 | `tailsitter.cpp` | 553-586 |
+| 过渡期间姿态覆盖 | `tailsitter.cpp` | 940-952 |
+| 过渡期间电机输出 | `tailsitter.cpp` | 285-341 |
+| 多旋翼输出跳过 | `quadplane.cpp` | 2041-2048 |
+| VTOL更新入口 | `tailsitter.cpp` | 885 |
+| 固定翼更新入口 | `tailsitter.cpp` | 830 |
