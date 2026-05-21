@@ -516,3 +516,126 @@ public:
 | AHRS 是什么？ | 更高层的抽象接口，可以选择 DCM/EKF2/EKF3 作为后端 |
 | AP_AHRS_NavEKF3 是什么？ | AHRS 适配器，把 NavEKF3 包装成标准后端接口 |
 | NavEKF3 是什么？ | 真正的 EKF3 实现，做传感器融合 |
+
+---
+
+## 十五、EKF 输出结果代码定位
+
+### 15.1 AHRS 层统一输出（适配器模式）
+
+**文件**: `libraries/AP_AHRS/AP_AHRS_NavEKF3.cpp:13-74`
+
+```cpp
+void AP_AHRS_NavEKF3::get_results(AP_AHRS_Backend::Estimates &results)
+{
+    // === 导航状态输出（姿态）===
+    EKF3.getRotationBodyToNED(results.dcm_matrix);   // 方向余弦矩阵
+    EKF3.getEulerAngles(eulers);                      // 欧拉角
+    EKF3.getQuaternion(results.quaternion);           // 四元数
+    results.attitude_valid = started;
+
+    // === 非导航状态输出（传感器偏差）===
+    EKF3.getGyroBias(-1, drift);                      // 陀螺零偏
+    results.gyro_drift = -drift;
+    EKF3.getAccelBias(-1, results.accel_bias);        // 加速度计零偏
+
+    // === 导航状态输出（速度）===
+    EKF3.getVelNED(results.velocity_NED);             // NED速度
+    results.velocity_NED_valid = true;
+    results.vert_pos_rate_D = EKF3.getPosDownDerivative();
+    results.vert_pos_rate_D_valid = true;
+
+    // === 导航状态输出（位置）===
+    results.location_valid = EKF3.getLLH(results.location);  // 经纬高位置
+}
+```
+
+### 15.2 EKF3 核心层输出（实际实现）
+
+**文件**: `libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp`
+
+#### 导航状态输出（直接来自 `outputDataNew`，当前时域）
+
+| 函数 | 行号 | 数据来源 |
+|------|------|----------|
+| `getEulerAngles()` | L126 | `outputDataNew.quat.to_euler()` |
+| `getRotationBodyToNED()` | L153 | `outputDataNew.quat.rotation_matrix()` |
+| `getQuaternion()` | L160 | `outputDataNew.quat` |
+| `getVelNED()` | L209 | `outputDataNew.velocity + velOffsetNED` |
+| `getPosNE()` | L257 | `outputDataNew.position.xy()` |
+| `getPosD_local()` | L298 | `outputDataNew.position.z + posOffsetNED.z` |
+| `getLLH()` | L334 | `outputDataNew.position` + origin |
+
+#### 非导航状态输出（来自 `stateStruct`，延迟时域）
+
+| 函数 | 行号 | 数据来源 |
+|------|------|----------|
+| `getGyroBias()` | L133 | `stateStruct.gyro_bias / dtEkfAvg` |
+| `getAccelBias()` | L143 | `stateStruct.accel_bias / dtEkfAvg` |
+| `getWind()` | L199 | `stateStruct.wind_vel.x/y` |
+| `getMagNED()` | L428 | `stateStruct.earth_magfield * 1000` |
+| `getMagXYZ()` | L434 | `stateStruct.body_magfield * 1000` |
+
+### 15.3 关键数据结构定义
+
+**24 状态结构体**（`AP_NavEKF3_core.h:574-588`）：
+
+```cpp
+struct state_elements {
+    QuaternionF quat;           // 0-3: 姿态（导航状态）
+    Vector3F    velocity;       // 4-6: 速度（导航状态）
+    Vector3F    position;       // 7-9: 位置（导航状态）
+    Vector3F    gyro_bias;      // 10-12: 陀螺零偏（非导航状态）
+    Vector3F    accel_bias;     // 13-15: 加速度计零偏（非导航状态）
+    Vector3F    earth_magfield; // 16-18: 地磁场（非导航状态）
+    Vector3F    body_magfield;  // 19-21: 机体磁场（非导航状态）
+    Vector2F    wind_vel;       // 22-23: 风速（非导航状态）
+};
+```
+
+**输出观测器结构体**（`AP_NavEKF3_core.h:590-594`）：
+
+```cpp
+struct output_elements {
+    QuaternionF quat;           // 姿态
+    Vector3F    velocity;       // 速度（已补偿到机体原点）
+    Vector3F    position;       // 位置（已补偿到机体原点）
+};
+```
+
+### 15.4 核心区别
+
+| 特性 | `stateStruct`（24状态） | `outputDataNew`（输出状态） |
+|------|------------------------|----------------------------|
+| **时域** | 延迟时域（fusion time horizon） | 当前时域（current time） |
+| **位置参考点** | IMU 位置 | 机体原点（body frame origin） |
+| **用途** | EKF 内部融合计算 | 外部输出给控制回路 |
+| **包含内容** | 24状态（导航+非导航） | 仅导航状态（姿态/速度/位置） |
+| **补偿** | 无 IMU 偏移补偿 | 有 `velOffsetNED`/`posOffsetNED` 补偿 |
+
+### 15.5 AHRS 主控调用流程
+
+**文件**: `libraries/AP_AHRS/AP_AHRS.cpp:701-751`
+
+```cpp
+void AP_AHRS::update_EKF3(void)
+{
+    if (ekf3.started) {
+        ekf3.update();                          // 1. 执行 EKF 预测+融合
+        ekf3_estimates = {};
+        ekf3.get_results(ekf3_estimates);       // 2. 获取 EKF 输出结果
+        if (_active_EKF_type() == EKFType::THREE) {
+            copy_estimates_from_backend_estimates(ekf3_estimates);  // 3. 复制到 AHRS 统一状态
+        }
+    }
+}
+```
+
+### 15.6 总结
+
+所有 EKF 状态（导航+非导航）都在 **NavEKF3_core** 的 `stateStruct` 中估计和维护。输出时：
+
+- **导航状态**通过**输出观测器** (`outputDataNew`) extrapolate 到当前时刻，并补偿 IMU 偏移
+- **非导航状态**直接从 `stateStruct` 读取
+
+AHRS 层通过 `AP_AHRS_NavEKF3` 适配器统一封装后提供给飞控使用。
